@@ -46,10 +46,11 @@ module.exports = async function handler(req, res) {
   const delivery = body.delivery === "pickup" ? "pickup" : "ship";
   const order = MMM.quote(body.items, delivery);
 
-  if (order.n === 0) {
+  const sent = Object.keys(body.items).length;
+  if (sent === 0) {
     return res.status(400).json({ error: "Your basket is empty." });
   }
-  if (order.lines.length !== Object.keys(body.items).length) {
+  if (order.lines.length !== sent) {
     return res.status(409).json({ error: "Something on the shelf changed since you added it. Please refresh the page and check your basket." });
   }
 
@@ -79,7 +80,7 @@ module.exports = async function handler(req, res) {
       key: "notes",
       type: "text",
       optional: true,
-      label: { type: "custom", custom: "Notes for Marli: soap scent, gift note" },
+      label: { type: "custom", custom: String(MMM.NOTES_LABEL || "Notes for Marli").slice(0, 50) },
       text: { maximum_length: 255 }
     }],
     custom_text: { submit: { message: MMM.CHECKOUT_NOTE } },
@@ -94,7 +95,7 @@ module.exports = async function handler(req, res) {
     params.shipping_options = [{
       shipping_rate_data: {
         type: "fixed_amount",
-        display_name: order.free ? "Free shipping" : "Shipping",
+        display_name: order.free ? "Free shipping" : (order.oversizeOnly ? "Oversized box for big torches" : "Shipping"),
         fixed_amount: { amount: cents(order.ship), currency: "usd" },
         tax_behavior: "exclusive"
       }
