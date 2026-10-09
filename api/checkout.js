@@ -1,13 +1,15 @@
 /* =====================================================================
    POST /api/checkout
    Takes the basket from the website, re-prices it from catalog.js (the
-   browser's numbers are never trusted), and opens a Stripe Checkout page
-   that collects the address, adds sales tax, and takes the payment.
+   browser's numbers are never trusted), checks it against what's left
+   in the batch, and opens a Stripe Checkout page that collects the
+   address, adds sales tax, and takes the payment.
 
    Needs one environment variable in Vercel: STRIPE_SECRET_KEY
    No packages to install.
    ===================================================================== */
 const MMM = require("../catalog.js");
+const { soldThisBatch } = require("./_sold.js");
 
 // Stripe's API wants nested form fields: line_items[0][price_data][currency]=usd
 function toForm(obj, prefix, out) {
@@ -40,24 +42,64 @@ module.exports = async function handler(req, res) {
   let body = req.body;
   if (typeof body === "string") { try { body = JSON.parse(body); } catch (e) { body = null; } }
   if (!body || typeof body !== "object" || !body.items || typeof body.items !== "object" || Array.isArray(body.items)) {
-    return res.status(400).json({ error: "Your basket couldn't be read. Please refresh and try again." });
+    return res.status(400).json({ error: "Your basket couldn't be read. Refresh the page and try again." });
+  }
+
+  const sent = Object.keys(body.items).length;
+  if (sent === 0) return res.status(400).json({ error: "Your basket is empty." });
+
+  const items = MMM.clean(body.items);
+  if (Object.keys(items).length !== sent) {
+    return res.status(409).json({ error: "Something on the shelf changed since you added it. Refresh the page and check your basket." });
+  }
+
+  // ---- is there enough left in the batch? ----
+  try {
+    const rem = MMM.remaining(await soldThisBatch(secret, { fresh: true }));
+    const short = MMM.shortfall(items, rem);
+    if (short) {
+      return res.status(409).json({
+        error: short.left === 0
+          ? short.label + " just sold out. Take it out of your basket to check out."
+          : "Only " + short.left + " left of " + short.label.toLowerCase() + ". Lower the amount in your basket to check out."
+      });
+    }
+  } catch (e) {
+    // If Stripe can't be read, let the sale through; Marli confirms every order by hand anyway.
+    console.error("stock check skipped:", e.message);
   }
 
   const delivery = body.delivery === "pickup" ? "pickup" : "ship";
-  const order = MMM.quote(body.items, delivery);
-
-  const sent = Object.keys(body.items).length;
-  if (sent === 0) {
-    return res.status(400).json({ error: "Your basket is empty." });
-  }
-  if (order.lines.length !== sent) {
-    return res.status(409).json({ error: "Something on the shelf changed since you added it. Please refresh the page and check your basket." });
-  }
+  const giftOn = !!(body.gift && body.gift.on);
+  const giftNote = giftOn && typeof body.gift.note === "string"
+    ? body.gift.note.replace(/\s+/g, " ").trim().slice(0, MMM.GIFT.noteMax) : "";
+  const order = MMM.quote(items, delivery, giftOn);
 
   const proto = String(req.headers["x-forwarded-proto"] || "https").split(",")[0].trim();
   const host  = String(req.headers["x-forwarded-host"] || req.headers.host || "").split(",")[0].trim();
   if (!host) return res.status(400).json({ error: "Bad request." });
   const origin = proto + "://" + host;
+
+  const lineItems = order.lines.map(function (l) {
+    return {
+      quantity: l.qty,
+      price_data: {
+        currency: "usd",
+        unit_amount: cents(l.item.price),
+        tax_behavior: "exclusive",
+        product_data: { name: l.item.name, description: l.item.size || undefined }
+      }
+    };
+  });
+  if (giftOn) {
+    lineItems.push({
+      quantity: 1,
+      price_data: {
+        currency: "usd", unit_amount: cents(MMM.GIFT.price), tax_behavior: "exclusive",
+        product_data: { name: MMM.GIFT.label, description: giftNote ? "Note: " + giftNote.slice(0, 180) : undefined }
+      }
+    });
+  }
 
   const params = {
     mode: "payment",
@@ -65,27 +107,19 @@ module.exports = async function handler(req, res) {
     cancel_url: origin + "/#shelf",
     automatic_tax: { enabled: true },
     phone_number_collection: { enabled: true },
-    line_items: order.lines.map(function (l) {
-      return {
-        quantity: l.qty,
-        price_data: {
-          currency: "usd",
-          unit_amount: cents(l.item.price),
-          tax_behavior: "exclusive",
-          product_data: { name: l.item.name, description: l.item.size || undefined }
-        }
-      };
-    }),
+    line_items: lineItems,
     custom_fields: [{
-      key: "notes",
-      type: "text",
-      optional: true,
+      key: "notes", type: "text", optional: true,
       label: { type: "custom", custom: String(MMM.NOTES_LABEL || "Notes for Marli").slice(0, 50) },
       text: { maximum_length: 255 }
     }],
     custom_text: { submit: { message: MMM.CHECKOUT_NOTE } },
     metadata: {
+      batch: MMM.BATCH.id,
+      skus: MMM.packItems(items).slice(0, 500),
       delivery: delivery,
+      gift: giftOn ? "yes" : "no",
+      gift_note: giftNote || undefined,
       order: order.lines.map(l => l.qty + " x " + l.item.name + (l.item.size ? " (" + l.item.size + ")" : "")).join("; ").slice(0, 500)
     }
   };
@@ -116,21 +150,18 @@ module.exports = async function handler(req, res) {
   try {
     stripeRes = await fetch("https://api.stripe.com/v1/checkout/sessions", {
       method: "POST",
-      headers: {
-        "Authorization": "Bearer " + secret,
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
+      headers: { "Authorization": "Bearer " + secret, "Content-Type": "application/x-www-form-urlencoded" },
       body: toForm(params).join("&")
     });
     data = await stripeRes.json();
   } catch (e) {
     console.error("Stripe request failed:", e);
-    return res.status(502).json({ error: "Checkout couldn't start. Please try again in a minute." });
+    return res.status(502).json({ error: "Checkout couldn't start. Try again in a minute." });
   }
 
   if (!stripeRes.ok || !data || !data.url) {
     console.error("Stripe error:", stripeRes.status, data && data.error);
-    return res.status(502).json({ error: "Checkout couldn't start. Please try again in a minute." });
+    return res.status(502).json({ error: "Checkout couldn't start. Try again in a minute." });
   }
 
   return res.status(200).json({ url: data.url });
